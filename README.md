@@ -17,11 +17,11 @@ Use the same wiring on both boards.
 | MISO | GPIO19 |
 | MOSI | GPIO23 |
 | NSS / CS | GPIO21 |
-| RESET | GPIO14 |
-| BUSY | GPIO27 |
-| DIO1 | GPIO26 |
+| RESET | GPIO22 |
+| BUSY | GPIO16 |
+| DIO1 | GPIO17 |
 
-GPIO16 and GPIO17 are intentionally left free for a later GPS UART.
+All radio signals are kept on the same exposed side of the ESP32 DevKit for easier breadboard wiring.
 
 ## Radio profile
 
