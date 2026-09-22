@@ -7,9 +7,9 @@ static constexpr int PIN_SCK  = 18;
 static constexpr int PIN_MISO = 19;
 static constexpr int PIN_MOSI = 23;
 static constexpr int PIN_NSS  = 21;
-static constexpr int PIN_RST  = 14;
-static constexpr int PIN_BUSY = 27;
-static constexpr int PIN_DIO1 = 26;
+static constexpr int PIN_RST  = 22;
+static constexpr int PIN_BUSY = 16;
+static constexpr int PIN_DIO1 = 17;
 
 #ifndef RANGE_ROLE_TX
 #define RANGE_ROLE_TX 0
