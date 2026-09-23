@@ -38,15 +38,15 @@ static constexpr int PIN_DIO1 = 17;
 #define PING_INTERVAL_MS 1000
 #endif
 #ifndef REPLY_TIMEOUT_MS
-#define REPLY_TIMEOUT_MS 600
+#define REPLY_TIMEOUT_MS 350
 #endif
 
-static constexpr uint8_t PROTOCOL_MAGIC = 0xC2;
-static constexpr uint8_t PROTOCOL_VERSION = 1;
-static constexpr uint8_t TYPE_PING = 1;
-static constexpr uint8_t TYPE_REPLY = 2;
+// Keep the old on-air length: 20 bytes total.
+// [0] sender ('A'/'B'), [1..3] sequence U24LE, [4..19] 16-byte message.
 static constexpr size_t PACKET_SIZE = 20;
+static constexpr size_t MESSAGE_SIZE = 16;
 static constexpr size_t LOG_LINES = 80;
+static constexpr uint32_t NODE_B_OFFSET_MS = PING_INTERVAL_MS / 2;
 
 SPIClass radioSpi(VSPI);
 SX1262 radio = new Module(PIN_NSS, PIN_DIO1, PIN_RST, PIN_BUSY, radioSpi);
@@ -56,64 +56,91 @@ static volatile bool radioIrq = false;
 static bool radioReady = false;
 static int16_t radioInitCode = 0;
 
-static uint32_t txSequence = 0;
-static uint32_t lastPeerSequence = 0;
-static bool havePeerSequence = false;
-static uint32_t txPackets = 0;
-static uint32_t rxPackets = 0;
-static uint32_t lostPackets = 0;
-static uint32_t timeoutPackets = 0;
-static uint32_t lastPingSentMs = 0;
-static uint32_t pendingPingSeq = 0;
-static uint32_t pendingPingStartedMs = 0;
-static bool pingPending = false;
-static float latestLocalRssi = -200.0f;
-static float latestRemoteRssi = -200.0f;
+static constexpr char NODE_ID = RANGE_ROLE_A ? 'A' : 'B';
+static constexpr char PEER_ID = RANGE_ROLE_A ? 'B' : 'A';
+static constexpr const char* WIFI_SSID = RANGE_ROLE_A ? "ESP-A" : "ESP-B";
+static constexpr const char* WIFI_PASSWORD = "core1262rx";
+
+// Each word is normalized to exactly 16 bytes on air: truncate if long, '_' pad if short.
+static const char* const MESSAGE_POOL[] = {
+  "Bamboozlementing", "Brouhahahahahaaa", "Cattywampusified", "Codswalloperying",
+  "Confusticationed", "Flummoxification", "Higgledypiggledy", "Hocuspocusifying",
+  "Kerfufflemakers", "Malarkeyization", "Mumbojumboifying", "Rigamaroleifying",
+  "Shenaniganizers", "Skedaddledoodler", "Snafuificationing", "Squeegeification",
+  "Absentmindedness", "Babooneryshiness", "Befuddlementness", "Bootlickeriously",
+  "Curmudgeonlyhood", "Featherbrainedly", "Fuddyuddyistical", "Giddyheadednesss",
+  "Harebrainedlynes", "Highfalutinismus", "Knowitallishness", "Nincompooperyism",
+  "Nincompoopshines", "Ninnyhammeringly", "Poppycockishness", "Rapscallionerise",
+  "Scallywagfulness", "Scatterbrainedly", "Sillybillynesses", "Smartypantsified",
+  "Snollygosterisms", "Toadeaterishness", "Tomfoolerymaking", "Whippersnapperin",
+  "Wiseackerinesses", "Baublecollection", "Blunderbussingly", "Doohickeygizmoes",
+  "Frillsandfurbelo", "Gewgawifications", "Gimcrackerything", "Jackolancanthorn",
+  "Kickshawsbaking", "Knickknackerying", "Pumpernickeling", "Snickersneeblade",
+  "Tchotchkeseeker", "Thingamajigified", "Whatchamacallits", "Balderdashedness",
+  "Boondogglingwise", "Bumbazlementings", "Claptrapitations", "Cockalorumnesses",
+  "Conundrumalities", "Coxcombicalities", "Fiddlestickingly", "Flabbergastingli",
+  "Flusteratednesss", "Folderollednesse", "Gerrymandererism", "Gibberishmongers",
+  "Gobbledygookers", "Hodgepodgeriness", "Hornswogglerisms", "Lickspittlerling",
+  "Pettifoggerizing", "Poltrooneryships", "Razzledazzleries", "Skullduggeriests",
+  "Taradiddleheaded", "Castlesintheairy", "Chimericalnesses", "Cloudcuckoolands",
+  "Daydreamingfully", "Donquixoteishnes", "Flashinthepaning", "Flybynightnesses",
+  "Forgetfulnesses!", "Gargantuanlylazy", "Gaudinessesfully", "Ignisfatuuslight",
+  "Meretriciousness", "Moonshinehunters", "Nambypambyismsy", "Phantasmagorical",
+  "Quixoticalnesses", "Quizzicalityness", "Reverieishnesses", "Tawdrinessesover",
+  "Utopianistifying", "Willothewispings"
+};
+static constexpr size_t MESSAGE_COUNT = sizeof(MESSAGE_POOL) / sizeof(MESSAGE_POOL[0]);
+
+static uint32_t ownSequence = 1;
+static uint32_t ownGenerated = 0;
+static uint32_t echoConfirmed = 0;
+static uint32_t echoMissed = 0;
+static uint32_t badEcho = 0;
+static uint32_t duplicatePeer = 0;
+
+static uint32_t peerSeqMax = 0;
+static uint32_t peerReceived = 0;
+static uint32_t peerMissed = 0;
+
+static uint8_t pendingPacket[PACKET_SIZE] = {0};
+static bool pendingEcho = false;
+static uint32_t pendingStartedMs = 0;
+static uint32_t nextOwnSendMs = 0;
+
+static float latestRssi = -200.0f;
 static uint16_t latestRttMs = 0;
-static uint32_t latestPacketMs = 0;
+static String lastSentMessage = "-";
+static String lastReceivedMessage = "-";
+static String lastEchoMessage = "-";
+static bool lastEchoMatched = false;
 
 static String logs[LOG_LINES];
 static size_t logHead = 0;
 static size_t logCount = 0;
 
-static constexpr const char* ROLE_NAME = RANGE_ROLE_A ? "A" : "B";
-static constexpr uint8_t ROLE_ID = RANGE_ROLE_A ? 1 : 2;
-static constexpr const char* AP_PASSWORD = "core1262rx";
+static void onRadioIrq() { radioIrq = true; }
 
-static void onRadioIrq() {
-  radioIrq = true;
+static uint32_t readU24(const uint8_t* p) {
+  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16);
 }
 
-static uint32_t readU32(const uint8_t* p) {
-  return (uint32_t)p[0] |
-         ((uint32_t)p[1] << 8) |
-         ((uint32_t)p[2] << 16) |
-         ((uint32_t)p[3] << 24);
-}
-
-static void writeU32(uint8_t* p, uint32_t v) {
+static void writeU24(uint8_t* p, uint32_t v) {
   p[0] = (uint8_t)v;
   p[1] = (uint8_t)(v >> 8);
   p[2] = (uint8_t)(v >> 16);
-  p[3] = (uint8_t)(v >> 24);
 }
 
-static int16_t readI16(const uint8_t* p) {
-  return (int16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+static String messageString(const uint8_t* packet) {
+  char text[MESSAGE_SIZE + 1];
+  memcpy(text, packet + 4, MESSAGE_SIZE);
+  text[MESSAGE_SIZE] = '\0';
+  return String(text);
 }
 
-static void writeI16(uint8_t* p, int16_t v) {
-  p[0] = (uint8_t)v;
-  p[1] = (uint8_t)((uint16_t)v >> 8);
-}
-
-static uint16_t readU16(const uint8_t* p) {
-  return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
-}
-
-static void writeU16(uint8_t* p, uint16_t v) {
-  p[0] = (uint8_t)v;
-  p[1] = (uint8_t)(v >> 8);
+static void normalizeMessage(const char* source, uint8_t* out) {
+  memset(out, '_', MESSAGE_SIZE);
+  const size_t n = min(strlen(source), MESSAGE_SIZE);
+  memcpy(out, source, n);
 }
 
 static void addLog(const String& line) {
@@ -130,42 +157,11 @@ static String logsJson() {
     String s = logs[idx];
     s.replace("\\", "\\\\");
     s.replace("\"", "\\\"");
-    s.replace("\n", "\\n");
     if (i) out += ",";
     out += "\"" + s + "\"";
   }
   out += "]";
   return out;
-}
-
-static bool validPacket(const uint8_t* p) {
-  return p[0] == PROTOCOL_MAGIC &&
-         p[3] == PROTOCOL_VERSION &&
-         p[16] == '1' && p[17] == '2' && p[18] == '6' && p[19] == '2';
-}
-
-static void buildPacket(uint8_t* p, uint8_t type, uint32_t sequence, uint32_t stampMs) {
-  memset(p, 0, PACKET_SIZE);
-  p[0] = PROTOCOL_MAGIC;
-  p[1] = type;
-  p[2] = ROLE_ID;
-  p[3] = PROTOCOL_VERSION;
-  writeU32(p + 4, sequence);
-  writeU32(p + 8, stampMs);
-  const int16_t rssiX10 = latestLocalRssi > -199.0f ? (int16_t)(latestLocalRssi * 10.0f) : INT16_MIN;
-  writeI16(p + 12, rssiX10);
-  writeU16(p + 14, latestRttMs);
-  p[16] = '1'; p[17] = '2'; p[18] = '6'; p[19] = '2';
-}
-
-static void updatePeerSequence(uint32_t sequence) {
-  if (havePeerSequence && sequence > lastPeerSequence + 1) {
-    lostPackets += sequence - lastPeerSequence - 1;
-  }
-  if (!havePeerSequence || sequence > lastPeerSequence) {
-    lastPeerSequence = sequence;
-    havePeerSequence = true;
-  }
 }
 
 static int16_t startReceive() {
@@ -176,45 +172,72 @@ static int16_t startReceive() {
 static bool initRadio() {
   radioSpi.begin(PIN_SCK, PIN_MISO, PIN_MOSI, PIN_NSS);
   radioInitCode = radio.beginFSK(
-      RADIO_FREQ_MHZ,
-      RADIO_BITRATE_KBPS,
-      RADIO_DEVIATION_KHZ,
-      RADIO_RX_BW_KHZ,
-      RADIO_TX_POWER_DBM,
-      RADIO_PREAMBLE_BITS);
-
+      RADIO_FREQ_MHZ, RADIO_BITRATE_KBPS, RADIO_DEVIATION_KHZ,
+      RADIO_RX_BW_KHZ, RADIO_TX_POWER_DBM, RADIO_PREAMBLE_BITS);
   if (radioInitCode != RADIOLIB_ERR_NONE) return false;
-  int16_t state = radio.setCurrentLimit(140.0);
-  if (state != RADIOLIB_ERR_NONE) {
-    radioInitCode = state;
-    return false;
-  }
+
+  radioInitCode = radio.setCurrentLimit(140.0);
+  if (radioInitCode != RADIOLIB_ERR_NONE) return false;
+
   radio.setPacketReceivedAction(onRadioIrq);
-  state = startReceive();
-  if (state != RADIOLIB_ERR_NONE) {
-    radioInitCode = state;
-    return false;
-  }
+  radioInitCode = startReceive();
+  if (radioInitCode != RADIOLIB_ERR_NONE) return false;
+
   radioReady = true;
   return true;
 }
 
-static bool transmitPacket(uint8_t type, uint32_t sequence, uint32_t stampMs) {
-  uint8_t packet[PACKET_SIZE];
-  buildPacket(packet, type, sequence, stampMs);
+static bool transmitRaw(const uint8_t* packet) {
   radio.clearPacketReceivedAction();
-  const int16_t state = radio.transmit(packet, PACKET_SIZE);
+  const int16_t txState = radio.transmit((uint8_t*)packet, PACKET_SIZE);
   radio.setPacketReceivedAction(onRadioIrq);
   const int16_t rxState = startReceive();
-  if (state == RADIOLIB_ERR_NONE) ++txPackets;
-  if (rxState != RADIOLIB_ERR_NONE) {
-    addLog(String("[RX-START-ERR] code=") + rxState);
-  }
-  if (state != RADIOLIB_ERR_NONE) {
-    addLog(String("[TX-ERR] code=") + state);
+  if (rxState != RADIOLIB_ERR_NONE) addLog(String("[RX-START-ERR] ") + rxState);
+  if (txState != RADIOLIB_ERR_NONE) {
+    addLog(String("[TX-ERR] ") + txState);
     return false;
   }
   return true;
+}
+
+static void buildOwnPacket(uint8_t* packet, uint32_t sequence) {
+  packet[0] = (uint8_t)NODE_ID;
+  writeU24(packet + 1, sequence);
+  const char* selected = MESSAGE_POOL[random(MESSAGE_COUNT)];
+  normalizeMessage(selected, packet + 4);
+}
+
+static void updatePeerSequence(uint32_t sequence) {
+  if (sequence == 0) return;
+
+  if (peerSeqMax == 0) {
+    peerSeqMax = sequence;
+    peerReceived = 1;
+    peerMissed = sequence - 1;
+    return;
+  }
+
+  if (sequence > peerSeqMax) {
+    peerMissed += sequence - peerSeqMax - 1;
+    peerSeqMax = sequence;
+    ++peerReceived;
+  } else {
+    ++duplicatePeer;
+  }
+}
+
+static void sendOwnPacket() {
+  if (pendingEcho) return;
+
+  const uint32_t sequence = ownSequence++;
+  buildOwnPacket(pendingPacket, sequence);
+  lastSentMessage = messageString(pendingPacket);
+
+  ++ownGenerated;
+  pendingStartedMs = millis();
+  pendingEcho = transmitRaw(pendingPacket);
+
+  addLog(String("[TX NEW] seq=") + sequence + " msg=" + lastSentMessage);
 }
 
 static void processPacket() {
@@ -224,120 +247,115 @@ static void processPacket() {
   uint8_t packet[PACKET_SIZE] = {0};
   const int16_t state = radio.readData(packet, PACKET_SIZE);
   if (state != RADIOLIB_ERR_NONE) {
-    addLog(String("[RX-ERR] code=") + state);
-    startReceive();
-    return;
-  }
-  if (!validPacket(packet)) {
-    addLog("[RX] ignored incompatible packet");
+    addLog(String("[RX-ERR] ") + state);
     startReceive();
     return;
   }
 
-  const uint8_t type = packet[1];
-  const uint8_t senderRole = packet[2];
-  const uint32_t sequence = readU32(packet + 4);
-  const uint32_t stampMs = readU32(packet + 8);
-  const int16_t peerReportedRssiX10 = readI16(packet + 12);
-  const uint16_t peerReportedRtt = readU16(packet + 14);
+  const char sender = (char)packet[0];
+  const uint32_t sequence = readU24(packet + 1);
+  latestRssi = radio.getRSSI();
 
-  latestLocalRssi = radio.getRSSI();
-  latestPacketMs = millis();
-  ++rxPackets;
-  if (peerReportedRssiX10 != INT16_MIN) {
-    latestRemoteRssi = (float)peerReportedRssiX10 / 10.0f;
-  }
-  if (!RANGE_ROLE_A && peerReportedRtt > 0) {
-    latestRttMs = peerReportedRtt;
-  }
-
-  if (RANGE_ROLE_A && type == TYPE_REPLY && senderRole == 2) {
-    if (pingPending && sequence == pendingPingSeq) {
-      latestRttMs = (uint16_t)min<uint32_t>(millis() - pendingPingStartedMs, 65535);
-      pingPending = false;
-    }
-    char line[180];
-    snprintf(line, sizeof(line),
-             "[REPLY] seq=%lu B->A=%.1f dBm A->B=%.1f dBm RTT=%u ms",
-             (unsigned long)sequence,
-             (double)latestLocalRssi,
-             (double)latestRemoteRssi,
-             latestRttMs);
-    addLog(line);
-  } else if (!RANGE_ROLE_A && type == TYPE_PING && senderRole == 1) {
+  if (sender == PEER_ID) {
     updatePeerSequence(sequence);
-    char line[180];
-    snprintf(line, sizeof(line),
-             "[PING] seq=%lu A->B=%.1f dBm B->A=%.1f dBm lastRTT=%u ms",
-             (unsigned long)sequence,
-             (double)latestLocalRssi,
-             (double)latestRemoteRssi,
-             latestRttMs);
-    addLog(line);
-    transmitPacket(TYPE_REPLY, sequence, stampMs);
-  } else {
-    startReceive();
+    lastReceivedMessage = messageString(packet);
+    addLog(String("[RX NEW] from=") + sender + " seq=" + sequence +
+           " msg=" + lastReceivedMessage + " RSSI=" + String(latestRssi, 1) + " dBm");
+
+    // Echo exactly what was received, byte-for-byte.
+    transmitRaw(packet);
+    addLog(String("[ECHO TX] seq=") + sequence + " msg=" + lastReceivedMessage);
+    return;
   }
+
+  if (sender == NODE_ID) {
+    lastEchoMessage = messageString(packet);
+    const bool same = pendingEcho && memcmp(packet, pendingPacket, PACKET_SIZE) == 0;
+
+    if (same) {
+      latestRttMs = (uint16_t)min<uint32_t>(millis() - pendingStartedMs, 65535);
+      ++echoConfirmed;
+      lastEchoMatched = true;
+      pendingEcho = false;
+      addLog(String("[ECHO OK] seq=") + sequence + " msg=" + lastEchoMessage +
+             " RTT=" + latestRttMs + " ms RSSI=" + String(latestRssi, 1) + " dBm");
+    } else {
+      ++badEcho;
+      lastEchoMatched = false;
+      addLog(String("[ECHO BAD] seq=") + sequence + " got=" + lastEchoMessage);
+    }
+    return;
+  }
+
+  addLog(String("[RX UNKNOWN] sender=") + sender);
+  startReceive();
 }
 
 static String statusJson() {
-  const uint32_t expected = rxPackets + lostPackets + timeoutPackets;
-  const float loss = expected ? (100.0f * (lostPackets + timeoutPackets) / expected) : 0.0f;
+  const float peerLossPct = peerSeqMax ? (100.0f * peerMissed / peerSeqMax) : 0.0f;
   String out = "{";
-  out += "\"role\":\"" + String(ROLE_NAME) + "\"";
+  out += "\"node\":\"" + String(NODE_ID) + "\"";
+  out += ",\"ssid\":\"" + String(WIFI_SSID) + "\"";
   out += ",\"radioReady\":" + String(radioReady ? "true" : "false");
   out += ",\"radioInitCode\":" + String(radioInitCode);
-  out += ",\"localRssi\":" + String(latestLocalRssi, 1);
-  out += ",\"remoteRssi\":" + String(latestRemoteRssi, 1);
+  out += ",\"rssi\":" + String(latestRssi, 1);
   out += ",\"rttMs\":" + String(latestRttMs);
-  out += ",\"tx\":" + String(txPackets);
-  out += ",\"rx\":" + String(rxPackets);
-  out += ",\"lost\":" + String(lostPackets + timeoutPackets);
-  out += ",\"lossPct\":" + String(loss, 2);
-  out += ",\"lastPacketMs\":" + String(latestPacketMs);
-  out += ",\"pending\":" + String(pingPending ? "true" : "false");
+  out += ",\"seqMax\":" + String(peerSeqMax);
+  out += ",\"received\":" + String(peerReceived);
+  out += ",\"missed\":" + String(peerMissed);
+  out += ",\"duplicates\":" + String(duplicatePeer);
+  out += ",\"lossPct\":" + String(peerLossPct, 2);
+  out += ",\"generated\":" + String(ownGenerated);
+  out += ",\"echoConfirmed\":" + String(echoConfirmed);
+  out += ",\"echoMissed\":" + String(echoMissed);
+  out += ",\"badEcho\":" + String(badEcho);
+  out += ",\"lastSent\":\"" + lastSentMessage + "\"";
+  out += ",\"lastReceived\":\"" + lastReceivedMessage + "\"";
+  out += ",\"lastEcho\":\"" + lastEchoMessage + "\"";
+  out += ",\"echoMatch\":" + String(lastEchoMatched ? "true" : "false");
   out += "}";
   return out;
 }
 
 static const char PAGE[] PROGMEM = R"HTML(
-<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Core1262 Link Test</title><style>
-body{font-family:Arial,sans-serif;background:#111;color:#eee;margin:0;padding:18px}h1{font-size:22px;margin:0 0 6px}.small{font-size:12px;color:#aaa;margin-bottom:14px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px;margin-bottom:14px}.card{background:#1c1c1c;border:1px solid #333;border-radius:10px;padding:14px}.k{font-size:12px;color:#999}.v{font-size:25px;margin-top:6px}.good{color:#49d17d}.bad{color:#ff6262}#logs{background:#050505;border:1px solid #333;border-radius:10px;padding:12px;height:44vh;overflow:auto;white-space:pre-wrap;font-family:monospace;font-size:13px}
-</style></head><body><h1>Core1262-HF Two-Way Link Test</h1><div class="small" id="meta">Loading...</div>
-<div class="grid"><div class="card"><div class="k">RADIO</div><div class="v" id="radio">-</div></div><div class="card"><div class="k">LOCAL RX RSSI</div><div class="v"><span id="local">-</span> dBm</div></div><div class="card"><div class="k">REMOTE RX RSSI</div><div class="v"><span id="remote">-</span> dBm</div></div><div class="card"><div class="k">RTT</div><div class="v"><span id="rtt">0</span> ms</div></div><div class="card"><div class="k">TX</div><div class="v" id="tx">0</div></div><div class="card"><div class="k">RX</div><div class="v" id="rx">0</div></div><div class="card"><div class="k">LOST</div><div class="v" id="lost">0</div></div><div class="card"><div class="k">LOSS</div><div class="v"><span id="loss">0</span>%</div></div></div>
-<div id="logs">Waiting for packets...</div><script>
-async function refresh(){try{const s=await fetch('/api/status').then(r=>r.json());meta.textContent='Role '+s.role+' | 869 MHz GFSK | AP Core1262-'+s.role+' | 192.168.4.1';radio.textContent=s.radioReady?'OK':'ERR '+s.radioInitCode;radio.className='v '+(s.radioReady?'good':'bad');local.textContent=s.localRssi;remote.textContent=s.remoteRssi;rtt.textContent=s.rttMs;tx.textContent=s.tx;rx.textContent=s.rx;lost.textContent=s.lost;loss.textContent=s.lossPct;const l=await fetch('/api/logs').then(r=>r.json());logs.textContent=l.join('\n');logs.scrollTop=logs.scrollHeight}catch(e){}}setInterval(refresh,500);refresh();
-</script></body></html>)HTML";
+<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>ESP Link Test</title>
+<style>body{font-family:Arial,sans-serif;background:#111;color:#eee;margin:0;padding:18px}h1{font-size:22px;margin:0 0 6px}.small{font-size:12px;color:#aaa;margin-bottom:14px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px;margin-bottom:14px}.card{background:#1c1c1c;border:1px solid #333;border-radius:10px;padding:14px}.k{font-size:12px;color:#999}.v{font-size:24px;margin-top:6px}.msg{font-family:monospace;font-size:16px}.good{color:#49d17d}.bad{color:#ff6262}#logs{background:#050505;border:1px solid #333;border-radius:10px;padding:12px;height:38vh;overflow:auto;white-space:pre-wrap;font-family:monospace;font-size:13px}</style></head>
+<body><h1>Core1262-HF Bidirectional Integrity Test</h1><div class="small" id="meta">Loading...</div>
+<div class="grid"><div class="card"><div class="k">RADIO</div><div class="v" id="radio">-</div></div><div class="card"><div class="k">RSSI</div><div class="v"><span id="rssi">-</span> dBm</div></div><div class="card"><div class="k">RTT</div><div class="v"><span id="rtt">0</span> ms</div></div><div class="card"><div class="k">SEQ MAX</div><div class="v" id="seq">0</div></div><div class="card"><div class="k">RECEIVED</div><div class="v" id="received">0</div></div><div class="card"><div class="k">MISSED</div><div class="v" id="missed">0</div></div><div class="card"><div class="k">DUPLICATES</div><div class="v" id="dup">0</div></div><div class="card"><div class="k">LOSS</div><div class="v"><span id="loss">0</span>%</div></div></div>
+<div class="grid"><div class="card"><div class="k">GENERATED</div><div class="v" id="generated">0</div></div><div class="card"><div class="k">ECHO CONFIRMED</div><div class="v" id="confirmed">0</div></div><div class="card"><div class="k">NO ECHO</div><div class="v" id="noecho">0</div></div><div class="card"><div class="k">BAD ECHO</div><div class="v" id="badecho">0</div></div></div>
+<div class="grid"><div class="card"><div class="k">LAST SENT</div><div class="msg" id="sent">-</div></div><div class="card"><div class="k">LAST RECEIVED</div><div class="msg" id="got">-</div></div><div class="card"><div class="k">LAST ECHO</div><div class="msg" id="echo">-</div></div><div class="card"><div class="k">ECHO MATCH</div><div class="v" id="match">-</div></div></div><div id="logs">Waiting for packets...</div>
+<script>async function refresh(){try{const s=await fetch('/api/status').then(r=>r.json());meta.textContent='Node '+s.node+' | WiFi '+s.ssid+' | 869 MHz GFSK | 20-byte packets';radio.textContent=s.radioReady?'OK':'ERR '+s.radioInitCode;radio.className='v '+(s.radioReady?'good':'bad');rssi.textContent=s.rssi;rtt.textContent=s.rttMs;seq.textContent=s.seqMax;received.textContent=s.received;missed.textContent=s.missed;dup.textContent=s.duplicates;loss.textContent=s.lossPct;generated.textContent=s.generated;confirmed.textContent=s.echoConfirmed;noecho.textContent=s.echoMissed;badecho.textContent=s.badEcho;sent.textContent=s.lastSent;got.textContent=s.lastReceived;echo.textContent=s.lastEcho;match.textContent=s.echoMatch?'MATCH':'MISMATCH';match.className='v '+(s.echoMatch?'good':'bad');const l=await fetch('/api/logs').then(r=>r.json());logs.textContent=l.join('\n');logs.scrollTop=logs.scrollHeight}catch(e){}}setInterval(refresh,500);refresh();</script></body></html>)HTML";
 
 static void startWeb() {
-  const String ssid = String("Core1262-") + ROLE_NAME;
   WiFi.mode(WIFI_AP);
-  WiFi.softAP(ssid.c_str(), AP_PASSWORD);
+  WiFi.softAP(WIFI_SSID, WIFI_PASSWORD);
   server.on("/", [](){ server.send_P(200, "text/html", PAGE); });
   server.on("/api/status", [](){ server.send(200, "application/json", statusJson()); });
   server.on("/api/logs", [](){ server.send(200, "application/json", logsJson()); });
   server.begin();
-  addLog(String("[WEB] SSID=") + ssid + " IP=" + WiFi.softAPIP().toString());
+  addLog(String("[WEB] SSID=") + WIFI_SSID + " IP=" + WiFi.softAPIP().toString());
 }
 
 void setup() {
   Serial.begin(115200);
   delay(1200);
+  randomSeed((uint32_t)esp_random());
   startWeb();
   radioReady = initRadio();
+
+  nextOwnSendMs = millis() + (RANGE_ROLE_A ? 250 : NODE_B_OFFSET_MS + 250);
+
   Serial.println();
-  Serial.println("=== Core1262-HF two-way range test ===");
-  Serial.printf("Role:          Node %s\n", ROLE_NAME);
+  Serial.println("=== Core1262-HF bidirectional integrity test ===");
+  Serial.printf("Node:          ESP-%c\n", NODE_ID);
+  Serial.printf("WiFi:          %s\n", WIFI_SSID);
+  Serial.printf("Packet size:   %u bytes\n", (unsigned)PACKET_SIZE);
   Serial.printf("Frequency:     %.3f MHz\n", (double)RADIO_FREQ_MHZ);
   Serial.printf("TX setting:    %d dBm (requested, not measured)\n", RADIO_TX_POWER_DBM);
   Serial.printf("Bitrate:       %.1f kbps\n", (double)RADIO_BITRATE_KBPS);
-  Serial.printf("Deviation:     %.1f kHz\n", (double)RADIO_DEVIATION_KHZ);
   Serial.printf("RX bandwidth:  %.1f kHz\n", (double)RADIO_RX_BW_KHZ);
-  Serial.printf("Preamble:      %d bits\n", RADIO_PREAMBLE_BITS);
-  Serial.printf("OCP limit:     %.1f mA\n", (double)radio.getCurrentLimit());
   if (!radioReady) addLog(String("[RADIO] init failed code=") + radioInitCode);
-  else addLog(String("[RADIO] Node ") + ROLE_NAME + " ready");
+  else addLog(String("[RADIO] ESP-") + NODE_ID + " ready");
 }
 
 void loop() {
@@ -345,24 +363,19 @@ void loop() {
   if (!radioReady) { delay(2); return; }
 
   processPacket();
+  const uint32_t now = millis();
 
-  if (RANGE_ROLE_A) {
-    const uint32_t now = millis();
-    if (pingPending && (uint32_t)(now - pendingPingStartedMs) >= REPLY_TIMEOUT_MS) {
-      ++timeoutPackets;
-      pingPending = false;
-      addLog(String("[TIMEOUT] seq=") + pendingPingSeq);
-    }
-    if (!pingPending && (uint32_t)(now - lastPingSentMs) >= PING_INTERVAL_MS) {
-      const uint32_t seq = txSequence++;
-      pendingPingSeq = seq;
-      pendingPingStartedMs = now;
-      lastPingSentMs = now;
-      pingPending = transmitPacket(TYPE_PING, seq, now);
-      if (pingPending) {
-        addLog(String("[PING-TX] seq=") + seq);
-      }
-    }
+  if (pendingEcho && (uint32_t)(now - pendingStartedMs) >= REPLY_TIMEOUT_MS) {
+    ++echoMissed;
+    pendingEcho = false;
+    lastEchoMatched = false;
+    addLog(String("[NO ECHO] seq=") + readU24(pendingPacket + 1) + " msg=" + lastSentMessage);
+  }
+
+  if (!pendingEcho && (int32_t)(now - nextOwnSendMs) >= 0) {
+    sendOwnPacket();
+    nextOwnSendMs += PING_INTERVAL_MS;
+    if ((int32_t)(now - nextOwnSendMs) >= 0) nextOwnSendMs = now + PING_INTERVAL_MS;
   }
 
   server.handleClient();
