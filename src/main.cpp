@@ -4,7 +4,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 
-// ESP32-WROOM -> Core1262-HF
+// ESP32-WROOM -> SX1262
 static constexpr int PIN_SCK  = 18;
 static constexpr int PIN_MISO = 19;
 static constexpr int PIN_MOSI = 23;
@@ -17,28 +17,33 @@ static constexpr int PIN_DIO1 = 17;
 #define RANGE_ROLE_A 1
 #endif
 #ifndef RADIO_FREQ_MHZ
-#define RADIO_FREQ_MHZ 869.0
+#define RADIO_FREQ_MHZ 869.5
 #endif
 #ifndef RADIO_BITRATE_KBPS
-#define RADIO_BITRATE_KBPS 25.0
+#define RADIO_BITRATE_KBPS 150.0
 #endif
 #ifndef RADIO_DEVIATION_KHZ
-#define RADIO_DEVIATION_KHZ 25.0
+#define RADIO_DEVIATION_KHZ 75.0
 #endif
 #ifndef RADIO_RX_BW_KHZ
-#define RADIO_RX_BW_KHZ 93.8
+#define RADIO_RX_BW_KHZ 312.0
 #endif
 #ifndef RADIO_TX_POWER_DBM
 #define RADIO_TX_POWER_DBM 22
 #endif
 #ifndef RADIO_PREAMBLE_BITS
-#define RADIO_PREAMBLE_BITS 64
+#define RADIO_PREAMBLE_BITS 40
 #endif
 #ifndef EXCHANGE_INTERVAL_MS
 #define EXCHANGE_INTERVAL_MS 1000
 #endif
 
-// Entire RF payload is exactly 2 bytes:
+// Production target packet PHY:
+// 869.5 MHz, GFSK, 150 kbps, 75 kHz deviation, 312 kHz RX BW,
+// 5-byte/40-bit preamble, 3-byte sync C1 94 C1, CRC on, whitening on.
+static uint8_t RADIO_SYNC_WORD[] = {0xC1, 0x94, 0xC1};
+
+// RF payload remains intentionally minimal for the link test:
 // [0] RSSI in signed dBm (int8_t)
 // [1] random number 0..100
 static constexpr size_t PACKET_SIZE = 2;
@@ -116,6 +121,17 @@ static bool initRadio() {
       RADIO_RX_BW_KHZ,
       RADIO_TX_POWER_DBM,
       RADIO_PREAMBLE_BITS);
+  if (radioInitCode != RADIOLIB_ERR_NONE) return false;
+
+  radioInitCode = radio.setSyncWord(RADIO_SYNC_WORD, sizeof(RADIO_SYNC_WORD));
+  if (radioInitCode != RADIOLIB_ERR_NONE) return false;
+
+  // Production config has CRC enabled. RadioLib uses its FSK CRC16 defaults here.
+  radioInitCode = radio.setCRC(2);
+  if (radioInitCode != RADIOLIB_ERR_NONE) return false;
+
+  // Production config has whitening enabled. RadioLib default whitening seed is used.
+  radioInitCode = radio.setWhitening(true);
   if (radioInitCode != RADIOLIB_ERR_NONE) return false;
 
   radioInitCode = radio.setCurrentLimit(140.0);
@@ -202,11 +218,11 @@ static String statusJson() {
 
 static const char PAGE[] PROGMEM = R"HTML(
 <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ESP RSSI Exchange</title>
+<title>Production GFSK RSSI Exchange</title>
 <style>
 body{font-family:Arial,sans-serif;background:#111;color:#eee;margin:0;padding:18px}h1{font-size:22px;margin:0 0 6px}.small{font-size:12px;color:#aaa;margin-bottom:14px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-bottom:14px}.card{background:#1c1c1c;border:1px solid #333;border-radius:10px;padding:14px}.k{font-size:12px;color:#999}.v{font-size:25px;margin-top:6px}.good{color:#49d17d}.bad{color:#ff6262}#logs{background:#050505;border:1px solid #333;border-radius:10px;padding:12px;height:42vh;overflow:auto;white-space:pre-wrap;font-family:monospace;font-size:13px}
 </style></head><body>
-<h1>Core1262-HF RSSI Exchange</h1><div class="small" id="meta">Loading...</div>
+<h1>SX1262 Production-PHY RSSI Exchange</h1><div class="small" id="meta">Loading...</div>
 <div class="grid">
 <div class="card"><div class="k">RADIO</div><div class="v" id="radio">-</div></div>
 <div class="card"><div class="k">TX POWER</div><div class="v"><span id="power">-</span> dBm</div></div>
@@ -218,7 +234,7 @@ body{font-family:Arial,sans-serif;background:#111;color:#eee;margin:0;padding:18
 <div class="card"><div class="k">RX COUNT</div><div class="v" id="rx">0</div></div>
 </div><div id="logs">Waiting...</div>
 <script>
-async function refresh(){try{const s=await fetch('/api/status').then(r=>r.json());meta.textContent='Node '+s.node+' | WiFi '+s.ssid+' | 869 MHz GFSK | 2-byte payload';radio.textContent=s.radioReady?'OK':'ERR '+s.radioInitCode;radio.className='v '+(s.radioReady?'good':'bad');power.textContent=s.txPower;local.textContent=s.localRssi;peerRssi.textContent=s.peerReportedRssi;myRand.textContent=s.ownRandom;peerRand.textContent=s.peerRandom;tx.textContent=s.txCount;rx.textContent=s.rxCount;const l=await fetch('/api/logs').then(r=>r.json());logs.textContent=l.join('\n');logs.scrollTop=logs.scrollHeight}catch(e){}}
+async function refresh(){try{const s=await fetch('/api/status').then(r=>r.json());meta.textContent='Node '+s.node+' | WiFi '+s.ssid+' | 869.5 MHz GFSK | 150 kbps | 75 kHz dev | 312 kHz RX BW | sync C1 94 C1 | CRC+whitening';radio.textContent=s.radioReady?'OK':'ERR '+s.radioInitCode;radio.className='v '+(s.radioReady?'good':'bad');power.textContent=s.txPower;local.textContent=s.localRssi;peerRssi.textContent=s.peerReportedRssi;myRand.textContent=s.ownRandom;peerRand.textContent=s.peerRandom;tx.textContent=s.txCount;rx.textContent=s.rxCount;const l=await fetch('/api/logs').then(r=>r.json());logs.textContent=l.join('\n');logs.scrollTop=logs.scrollHeight}catch(e){}}
 setInterval(refresh,400);refresh();
 </script></body></html>)HTML";
 
@@ -240,13 +256,19 @@ void setup() {
   radioReady = initRadio();
 
   Serial.println();
-  Serial.println("=== Core1262-HF RSSI + random exchange ===");
+  Serial.println("=== SX1262 production-PHY RSSI + random exchange ===");
   Serial.printf("Node:          %c\n", NODE_ID);
   Serial.printf("WiFi:          %s\n", WIFI_SSID);
   Serial.printf("RF payload:    2 bytes (RSSI, random 0..100)\n");
   Serial.printf("Frequency:     %.3f MHz\n", (double)RADIO_FREQ_MHZ);
   Serial.printf("TX setting:    %d dBm (requested, not measured)\n", RADIO_TX_POWER_DBM);
   Serial.printf("Bitrate:       %.1f kbps\n", (double)RADIO_BITRATE_KBPS);
+  Serial.printf("Deviation:     %.1f kHz\n", (double)RADIO_DEVIATION_KHZ);
+  Serial.printf("RX bandwidth:  %.1f kHz\n", (double)RADIO_RX_BW_KHZ);
+  Serial.printf("Preamble:      %d bits (5 bytes)\n", RADIO_PREAMBLE_BITS);
+  Serial.println("Sync word:     C1 94 C1");
+  Serial.println("CRC:           ON (RadioLib FSK CRC16 defaults)");
+  Serial.println("Whitening:     ON (RadioLib default seed)");
 
   if (!radioReady) {
     addLog(String("[RADIO] init failed code=") + radioInitCode);
@@ -263,7 +285,7 @@ void loop() {
 
   processPacket();
 
-  // A drives the exchange once per second. B only replies.
+  // A drives the test exchange once per second. B only replies.
   if (RANGE_ROLE_A) {
     const uint32_t now = millis();
     if ((uint32_t)(now - lastExchangeMs) >= EXCHANGE_INTERVAL_MS) {
